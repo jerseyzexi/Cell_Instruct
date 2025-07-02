@@ -42,6 +42,7 @@ from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
+from perturbation_encoder import PerturbationEncoder, PerturbationEncoderInference
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
@@ -63,7 +64,7 @@ check_min_version("0.35.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 DATASET_NAME_MAPPING = {
-    "fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"),
+    "fusing/instructpix2pix-1000-samples": ("original_image", "edit_prompt", "edited_image"),
 }
 WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt"]
 
@@ -115,8 +116,8 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
-        required=True,
+        default="/stable-diffusion-v1-4",
+        required=False,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -393,6 +394,14 @@ def parse_args():
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
     )
+
+    parser.add_argument(
+        "--dataset_id",
+        type=str,
+        default=None,
+        help=("The name of the Dataset."),
+    )
+
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
@@ -402,9 +411,6 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
@@ -455,6 +461,13 @@ def main():
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
 
+
+    perturbation_encoder = PerturbationEncoder(
+        dataset_id="HUVEC",
+        model_type="conditional",
+        model_name="SD",
+    )
+
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
     # Make one log on every process with the configuration for debugging.
@@ -464,6 +477,7 @@ def main():
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
+
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -489,12 +503,7 @@ def main():
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
-    )
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-    )
+
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
     )
@@ -507,10 +516,13 @@ def main():
     # then fine-tuned on the custom InstructPix2Pix dataset. This modified UNet is initialized
     # from the pre-trained checkpoints. For the extra channels added to the first layer, they are
     # initialized to zero.
+
+    #修改unet使其第一层能够接受原始图片以及条件图像的合并数据
     logger.info("Initializing the InstructPix2Pix UNet from the pretrained UNet.")
     in_channels = 8
     out_channels = unet.conv_in.out_channels
     unet.register_to_config(in_channels=in_channels)
+
 
     with torch.no_grad():
         new_conv_in = nn.Conv2d(
@@ -522,7 +534,7 @@ def main():
 
     # Freeze vae and text_encoder
     vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
+
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -630,11 +642,9 @@ def main():
         )
     else:
         data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
         dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
+            "csv",
+            data_files="train.csv",
             cache_dir=args.cache_dir,
         )
         # See more about loading custom images at
@@ -673,11 +683,11 @@ def main():
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
-    def tokenize_captions(captions):
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        return inputs.input_ids
+    #def tokenize_captions(captions):
+    #    inputs = tokenizer(
+    #        captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+    #    )
+    #    return inputs.input_ids
 
     # Preprocessing the datasets.
     train_transforms = transforms.Compose(
@@ -717,7 +727,9 @@ def main():
 
         # Preprocess the captions.
         captions = list(examples[edit_prompt_column])
-        examples["input_ids"] = tokenize_captions(captions)
+        #examples["input_ids"] = tokenize_captions(captions)
+        embeds = [perturbation_encoder.get_perturbation_embedding(c).squeeze(0) for c in captions]
+        examples["input_ids"] = torch.stack(embeds)
         return examples
 
     with accelerator.main_process_first():
@@ -731,11 +743,18 @@ def main():
         original_pixel_values = original_pixel_values.to(memory_format=torch.contiguous_format).float()
         edited_pixel_values = torch.stack([example["edited_pixel_values"] for example in examples])
         edited_pixel_values = edited_pixel_values.to(memory_format=torch.contiguous_format).float()
-        input_ids = torch.stack([example["input_ids"] for example in examples])
+        #input_ids = torch.stack([example["input_ids"] for example in examples])
+        #return {
+        #    "original_pixel_values": original_pixel_values,
+        #    "edited_pixel_values": edited_pixel_values,
+        #    "input_ids": input_ids,
+        #}
+
+        prompt_embeds = torch.stack([example["input_ids"] for example in examples])
         return {
             "original_pixel_values": original_pixel_values,
             "edited_pixel_values": edited_pixel_values,
-            "input_ids": input_ids,
+            "input_ids": prompt_embeds,
         }
 
     # DataLoaders creation:
@@ -783,7 +802,7 @@ def main():
         weight_dtype = torch.bfloat16
 
     # Move text_encode and vae to gpu and cast to weight_dtype
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
+
     vae.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -875,7 +894,11 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Get the text embedding for conditioning.
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+               # encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+
+                encoder_hidden_states = batch["input_ids"].to(weight_dtype)
+
+
 
                 # Get the additional image embedding for conditioning.
                 # Instead of getting a diagonal Gaussian here, we simply take the mode.
@@ -889,7 +912,8 @@ def main():
                     prompt_mask = random_p < 2 * args.conditioning_dropout_prob
                     prompt_mask = prompt_mask.reshape(bsz, 1, 1)
                     # Final text conditioning.
-                    null_conditioning = text_encoder(tokenize_captions([""]).to(accelerator.device))[0]
+                    # null_conditioning = text_encoder(tokenize_captions([""]).to(accelerator.device))[0]
+                    null_conditioning = perturbation_encoder.get_perturbation_embedding("EMPTY").squeeze(0).to(weight_dtype)
                     encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
 
                     # Sample masks for the original images.
@@ -984,7 +1008,7 @@ def main():
                 pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
                     unet=unwrap_model(unet),
-                    text_encoder=unwrap_model(text_encoder),
+                    text_encoder=None,
                     vae=unwrap_model(vae),
                     revision=args.revision,
                     variant=args.variant,
@@ -1013,7 +1037,7 @@ def main():
 
         pipeline = StableDiffusionInstructPix2PixPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
-            text_encoder=unwrap_model(text_encoder),
+            text_encoder=None,
             vae=unwrap_model(vae),
             unet=unwrap_model(unet),
             revision=args.revision,
