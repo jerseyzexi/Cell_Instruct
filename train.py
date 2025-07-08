@@ -34,6 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
+from datasets.features import Image
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -46,6 +47,7 @@ from perturbation_encoder import PerturbationEncoder, PerturbationEncoderInferen
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
+import os
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionInstructPix2PixPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
@@ -53,11 +55,13 @@ from diffusers.utils import check_min_version, deprecate, is_wandb_available
 from diffusers.utils.constants import DIFFUSERS_REQUEST_TIMEOUT
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+from PIL import ImageFile
 
 
 if is_wandb_available():
     import wandb
 
+ImageFile.LOAD_TRUNCATED_IMAGES = True  # 允许载入部分截断的图片
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.35.0.dev0")
 
@@ -68,6 +72,14 @@ DATASET_NAME_MAPPING = {
 }
 WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt"]
 
+def safe_filter(example):
+    try:
+        # 这里尝试打开两张图，如果有任何一张损坏就会触发 OSError
+        _ = example["original_image"].convert("RGB")
+        _ = example["edited_image"].convert("RGB")
+        return True
+    except OSError:
+        return False
 
 def log_validation(
     pipeline,
@@ -162,7 +174,7 @@ def parse_args():
     parser.add_argument(
         "--original_image_column",
         type=str,
-        default="input_image",
+        default="original_image",
         help="The column of the dataset containing the original image on which edits where made.",
     )
     parser.add_argument(
@@ -432,6 +444,8 @@ def download_image(url):
 
 
 def main():
+    os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+    os.environ['HF_HOME'] = '/root/autodl-tmp/cache/'
     args = parse_args()
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
@@ -502,13 +516,14 @@ def main():
             ).repo_id
 
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler",timeout=60)
 
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision, variant=args.variant
     )
+
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
+        args.pretrained_model_name_or_path, revision=args.non_ema_revision,subfolder="unet",variant=args.variant
     )
 
     # InstructPix2Pix uses an additional image for conditioning. To accommodate that,
@@ -644,7 +659,7 @@ def main():
         data_files = {}
         dataset = load_dataset(
             "csv",
-            data_files="train.csv",
+            data_files="train2.csv",
             cache_dir=args.cache_dir,
         )
         # See more about loading custom images at
@@ -736,6 +751,9 @@ def main():
         if args.max_train_samples is not None:
             dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
+        dataset = dataset.cast_column("original_image", Image())
+        dataset = dataset.cast_column("edited_image", Image())
+        dataset["train"] = dataset["train"].filter(safe_filter)
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
     def collate_fn(examples):
@@ -913,7 +931,7 @@ def main():
                     prompt_mask = prompt_mask.reshape(bsz, 1, 1)
                     # Final text conditioning.
                     # null_conditioning = text_encoder(tokenize_captions([""]).to(accelerator.device))[0]
-                    null_conditioning = perturbation_encoder.get_perturbation_embedding("EMPTY").squeeze(0).to(weight_dtype)
+                    null_conditioning = perturbation_encoder.get_perturbation_embedding("EMPTY").squeeze(0).to(accelerator.device,weight_dtype)
                     encoder_hidden_states = torch.where(prompt_mask, null_conditioning, encoder_hidden_states)
 
                     # Sample masks for the original images.

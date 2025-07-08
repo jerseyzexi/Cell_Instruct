@@ -13,8 +13,8 @@ def image_path(dataset, experiment, plate, well, site,  base_path):
         f"{well}_s{site}.png"
     )
 
-BASE_PATH = r"D:\PycharmProject\重要数据\rxrx1-images\rxrx1\HUVEC"
-META_CSV  = r"D:\PycharmProject\重要数据\rxrx1-metadata\rxrx1\metadata.csv"
+BASE_PATH = r"/root/autodl-tmp/HUVEC"
+META_CSV  = r"/root/autodl-tmp/rxrx1-metadata/rxrx1/metadata.csv"
 
 
 
@@ -32,7 +32,16 @@ def make_paths(row, suffix):
         )
     )
     return paths
-
+def make_path(row, suffix):
+    """构造单个图片的完整路径"""
+    return image_path(
+        dataset=row["dataset"],
+        experiment=row["experiment"],
+        plate=row["plate"],
+        site=row["site"],
+        well=row[f"well{suffix}"],
+        base_path=BASE_PATH,
+    )
 
 
 
@@ -40,7 +49,7 @@ def make_paths(row, suffix):
 # ———— 1. 读 Metadata ————
 df = pd.read_csv(META_CSV)
 df= df[ df['cell_type'] == 'HUVEC' ]
-df= df[ df['dataset'] == 'train' ]
+df= df[ df['dataset'] == 'test' ]
 # ———— 2. 分离原始（negative）与编辑（treatment）行 ————
 df_orig = df[df['well_type'] == 'negative_control']
 df_edit = df[df['well_type'] == 'treatment']
@@ -53,8 +62,8 @@ df_map = pd.merge(
 )
 
 print(df_map)
-df_map['original_image'] = df_map.apply(lambda r: make_paths(r, '_orig'), axis=1)
-df_map['edited_image'  ] = df_map.apply(lambda r: make_paths(r, '_edit'), axis=1)
+df_map['original_image'] = df_map.apply(lambda r: make_path(r, '_orig'), axis=1)
+df_map['edited_image'  ] = df_map.apply(lambda r: make_path(r, '_edit'), axis=1)
 df_map['edit_prompt'   ] = df_map['sirna_edit']   # treatment 行的 sirna
 
 
@@ -63,7 +72,7 @@ df_final = df_map[['original_image', 'edit_prompt', 'edited_image']]
 dataset = Dataset.from_pandas(df_final)
 
 # ———— 6. （可选）保存到 CSV，以供后续 load_dataset("csv") ————
-df_final.to_csv("train.csv", index=False)
+df_final.to_csv("validate.csv", index=False)
 print("Done! 生成三列 mapping.csv：original_image, edit_prompt, edited_image")
 
 

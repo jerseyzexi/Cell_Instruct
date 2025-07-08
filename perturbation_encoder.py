@@ -49,7 +49,7 @@ class PerturbationEncoder:
 
         if identifier == 'EMPTY':
             # create an np array of size 512 and fill it with 1
-            embedding = np.ones(512)
+            embedding = np.ones(77)
 
         else:
             if ';' in identifier:
@@ -127,7 +127,7 @@ class PerturbationEncoder:
         # pad gene_embedding with value 1 to have dimension 768
         # (768 is SD prompt encoding size)
         # final_size = 768
-        final_size = 2048
+        final_size = 768
 
         # Calculate the amount of padding on each side
         padding_left = (final_size - len(embedding)) // 2
@@ -137,7 +137,7 @@ class PerturbationEncoder:
             embedding, (padding_left, padding_right), 'constant', 1)
         # replicate padded_tensor to have dimension (bs, 77, 768)
         # padded_tensor = padded_tensor.repeat(1, 77, 1)
-        padded_tensor = padded_tensor.repeat(1, 512, 1)
+        padded_tensor = padded_tensor.repeat(1, 77, 1)
         return padded_tensor
 
     def get_perturbation_embedding(self, identifier):
